@@ -199,7 +199,7 @@ ald = dinv.sampling.ALDDataFidelity(weight=1.0)
 #       - \lambda \frac{A^\dagger (A x_t - y_t)}{\sigma_y^2+\gamma_t^2}.
 #
 
-score_sde = dinv.sampling.ScoreSDEDataFidelity(weight=1.0)
+# score_sde = dinv.sampling.ScoreSDEDataFidelity(weight=1.0)
 ilvr = dinv.sampling.ILVRDataFidelity(weight=1.0)
 
 # %%
@@ -239,9 +239,8 @@ ddnm = dinv.sampling.DDNMDataFidelity(
 
 data_fidelities = {
     "Score-ALD": ald,
-    "Score-SDE": score_sde,
     "ILVR": ilvr,
-    "DDNM": ddnm,
+    "noise-aware DDNM": ddnm,
 }
 
 gradients = {}
@@ -290,16 +289,49 @@ sde = dinv.sampling.VarianceExplodingDiffusion(
     dtype=dtype,
 )
 
+clean_physics = dinv.physics.Inpainting(
+    img_size=x_true.shape[1:],
+    mask=mask,
+    device=device,
+    noise_model=dinv.physics.GaussianNoise(sigma=0.0),
+)
+
+# current physics has sigma_y = measurement_noise
+# and is used by ALD / ILVR / noise-aware DDNM
+methods = {
+    "Score-ALD": {
+        "data_fidelity": ald,
+        "y": y,
+        "physics": physics,
+    },
+    "ILVR": {
+        "data_fidelity": ilvr,
+        "y": y,
+        "physics": physics,
+    },
+    "noise-aware DDNM": {
+        "data_fidelity": ddnm,
+        "y": y,
+        "physics": physics,
+    },
+    "original DDNM": {
+        "data_fidelity": ddnm,
+        "y": y,                 # keep the same noisy observation
+        "physics": clean_physics,  # but ignore sigma_y in the guidance
+    },
+}
+
 posterior_samples = {}
-for name, data_fidelity in data_fidelities.items():
-    if name == "Moment Matching" and device.type == "cpu":
-        precomputed_sample = dinv.utils.load_url_image(
-            "https://huggingface.co/deepinv/demo/resolve/main/" "moment_matching.png",
-            device=device,
-            dtype=x_true.dtype,
-        )
-        posterior_samples[name] = precomputed_sample[:, : x_true.shape[1]]
-        continue
+# for name, data_fidelity in data_fidelities.items():
+#     if name == "Moment Matching" and device.type == "cpu":
+#         precomputed_sample = dinv.utils.load_url_image(
+#             "https://huggingface.co/deepinv/demo/resolve/main/" "moment_matching.png",
+#             device=device,
+#             dtype=x_true.dtype,
+#         )
+#         posterior_samples[name] = precomputed_sample[:, : x_true.shape[1]]
+#         continue
+for name, cfg in methods.items():
 
     solver = dinv.sampling.EulerSolver(
         timesteps=timesteps,
@@ -317,8 +349,8 @@ for name, data_fidelity in data_fidelities.items():
 
     with torch.no_grad():
         posterior_samples[name] = posterior_sampler(
-            y=y,
-            physics=physics,
+            y=cfg["y"],
+            physics=cfg["physics"],
             seed=1,
             denoise_output=True,
         ).clip(0.0, 1.0)
@@ -329,10 +361,13 @@ rows = [
     {
         "Ground truth": x_true,
         "Measurement": y,
+        **{
+            name: posterior_samples[name] for name in ("original DDNM",)
+        },
     },
     {
         **{
-            name: posterior_samples[name] for name in ("Score-ALD", "ILVR", "DDNM")
+            name: posterior_samples[name] for name in ("Score-ALD", "ILVR", "noise-aware DDNM")
         },
     },
 ]
@@ -403,6 +438,19 @@ dinv.utils.plot(
         "DDNM": x_ddnm,
     }
 )
+
+# %%
+print("Noisy physics sigma:", physics.noise_model.sigma)
+print("Clean physics sigma:", clean_physics.noise_model.sigma)
+
+for name, cfg in methods.items():
+    print(
+        name,
+        "sigma_y =", cfg["physics"].noise_model.sigma,
+        "same physics =", cfg["physics"] is physics,
+        "same y =", cfg["y"] is y,
+    )
+
 # %%
 # :References:
 #
