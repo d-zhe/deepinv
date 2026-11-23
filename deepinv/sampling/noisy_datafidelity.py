@@ -926,8 +926,19 @@ class DDNMDataFidelity(NoisyDataFidelity):
         # residual
         residual = physics.A(x0_t) - y
 
-        # Negative measurement score
-        grad = self.weight * physics.A_dagger(residual) / sigma_t**2
+        sigma_y = physics.noise_model.sigma
+
+        lambda_t = sigma_t**2 / (sigma_t**2 + sigma_y**2)
+
+        # - nabla_{x_t} log p_t(y | x_t)
+        grad = self.weight * lambda_t * physics.A_dagger(residual) / sigma_t**2
+
+        # grad = (
+        #     self.weight
+        #     * physics.A_dagger(residual)
+        #     / (sigma_t**2 + sigma_y**2)
+        # )
+        print(f"computing DDNM+ grad...")
 
         if get_model_outputs:
             return grad, x0_t.detach()
