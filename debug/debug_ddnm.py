@@ -338,7 +338,7 @@ for name, cfg in methods.items():
         rng=torch.Generator(device=device),
     )
     posterior_sampler = dinv.sampling.PosteriorDiffusion(
-        data_fidelity=data_fidelity,
+        data_fidelity=cfg["data_fidelity"],
         denoiser=denoiser,
         sde=sde,
         solver=solver,
@@ -361,22 +361,28 @@ rows = [
     {
         "Ground truth": x_true,
         "Measurement": y,
+        
+    },
+    {
         **{
-            name: posterior_samples[name] for name in ("original DDNM",)
+            name: posterior_samples[name] for name in ("Score-ALD", "ILVR",)
         },
     },
     {
         **{
-            name: posterior_samples[name] for name in ("Score-ALD", "ILVR", "noise-aware DDNM")
+            name: posterior_samples[name] for name in ("original DDNM",)
         },
-    },
+        **{
+            name: posterior_samples[name] for name in ( "noise-aware DDNM",)
+        },
+    }
 ]
 
 # fig, axs = plt.subplots(
 #     len(rows), 4, figsize=(12, 6.5), squeeze=False, layout="compressed"
 # )
 fig, axs = plt.subplots(
-    len(rows), 3, figsize=(12, 6.5), squeeze=False, layout="compressed"
+    len(rows), 2, figsize=(5, 8), squeeze=False, layout="compressed"
 )
 for row, images in zip(axs, rows, strict=True):
     n = len(images)
@@ -394,50 +400,144 @@ plt.show()
 # DDNM: noiseless inpainting
 # -------------------------
 
-clean_physics = dinv.physics.Inpainting(
-    img_size=x_true.shape[1:],
-    mask=mask,
-    device=device,
-    noise_model=dinv.physics.GaussianNoise(sigma=0.0),
-)
+# clean_physics = dinv.physics.Inpainting(
+#     img_size=x_true.shape[1:],
+#     mask=mask,
+#     device=device,
+#     noise_model=dinv.physics.GaussianNoise(sigma=0.0),
+# )
 
-y_clean = clean_physics(x_true)
+# y_clean = clean_physics(x_true)
 
-ddnm = dinv.sampling.DDNMDataFidelity(
-    denoiser=denoiser,
-    weight=1.0,
-)
+# ddnm = dinv.sampling.DDNMDataFidelity(
+#     denoiser=denoiser,
+#     weight=1.0,
+# )
 
-ddnm_solver = dinv.sampling.EulerSolver(
-    timesteps=timesteps,
-    rng=torch.Generator(device=device),
-)
+# ddnm_solver = dinv.sampling.EulerSolver(
+#     timesteps=timesteps,
+#     rng=torch.Generator(device=device),
+# )
 
-ddnm_sampler = dinv.sampling.PosteriorDiffusion(
+# ddnm_sampler = dinv.sampling.PosteriorDiffusion(
+#     data_fidelity=ddnm,
+#     denoiser=denoiser,
+#     sde=sde,
+#     solver=ddnm_solver,
+#     device=device,
+#     dtype=dtype,
+#     verbose=False,
+# )
+
+# with torch.no_grad():
+#     x_ddnm = ddnm_sampler(
+#         y_clean,
+#         clean_physics,
+#         seed=1,
+#         denoise_output=True,
+#     ).clip(0, 1)
+
+# dinv.utils.plot(
+#     {
+#         "Ground truth": x_true,
+#         "Measurement": y_clean,
+#         "DDNM": x_ddnm,
+#     }
+# )
+
+# %%
+# Check the cancellation of prior and measurement scores
+
+probe = dinv.sampling.PosteriorDiffusion(
     data_fidelity=ddnm,
     denoiser=denoiser,
     sde=sde,
-    solver=ddnm_solver,
+    solver=dinv.sampling.EulerSolver(
+        timesteps=timesteps,
+        rng=torch.Generator(device=device),
+    ),
     device=device,
     dtype=dtype,
     verbose=False,
 )
 
-with torch.no_grad():
-    x_ddnm = ddnm_sampler(
-        y_clean,
-        clean_physics,
-        seed=1,
-        denoise_output=True,
-    ).clip(0, 1)
+denoiser.eval()
 
-dinv.utils.plot(
-    {
-        "Ground truth": x_true,
-        "Measurement": y_clean,
-        "DDNM": x_ddnm,
-    }
+t = torch.tensor(0.5, device=device, dtype=dtype)
+sigma = sde.sigma_t(t)
+
+rng = torch.Generator(device=device).manual_seed(123)
+eps = torch.randn(
+    x_true.shape,
+    generator=rng,
+    device=device,
+    dtype=dtype,
 )
+
+# State in [-1, 1] coordinates
+x = 2 * x_true.to(dtype) - 1 + sigma * eps
+
+# State and noise level in [0, 1] coordinates
+z = (x + 1) / 2
+tau = sigma / 2
+
+with torch.no_grad():
+    # Denoiser output used by the DDNM data fidelity
+    grad_z, D_data = ddnm.grad(
+        z,
+        y,
+        physics=physics,
+        sigma=tau,
+        get_model_outputs=True,
+    )
+
+    D_data = D_data.to(dtype)
+
+    # Denoiser output used by the unconditional SDE score
+    D_prior = (
+        probe.sde.denoiser(
+            x.float(),
+            sigma.float(),
+        ).to(dtype) + 1
+    ) / 2
+
+    # Prior score from the library
+    s_prior = probe.sde.score(x, t)
+
+    # Prior score reconstructed from the DDNM denoiser
+    s_prior_expected = (2 * D_data - 1 - x) / sigma**2
+
+    # Posterior score from the full DeepInverse call chain
+    s_post = probe.score(y, physics, x, t)
+
+    # Direct soft conditional-mean approximation
+    sigma_y = physics.noise_model.sigma
+    lambda_t = tau**2 / (tau**2 + sigma_y**2)
+
+    D_cond = (
+        D_data
+        + lambda_t
+        * physics.A_dagger(y - physics.A(D_data))
+    )
+
+    # Conditional Tweedie, without Bayes decomposition
+    s_post_direct = (2 * D_cond - 1 - x) / sigma**2
+
+
+def compare(name, a, b):
+    diff = (a - b).norm()
+    relative = diff / (b.norm() + 1e-12)
+    print(f"{name:25s} relative error = {relative.item():.3e}")
+
+
+print(
+    "Same underlying denoiser:",
+    getattr(probe.sde.denoiser, "model", None) is ddnm.denoiser,
+)
+
+compare("Denoiser outputs", D_prior, D_data)
+compare("Prior score", s_prior, s_prior_expected)
+compare("Posterior score", s_post, s_post_direct)
 
 # %%
 print("Noisy physics sigma:", physics.noise_model.sigma)

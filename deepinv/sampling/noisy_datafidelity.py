@@ -836,7 +836,7 @@ class MomentMatchingDataFidelity(NoisyDataFidelity):
 
 class DDNMDataFidelity(NoisyDataFidelity):
     r"""
-    Denoising Diffusion Null-Space Model (DDNM) data-fidelity term for noiseless linear inverse problems. 
+    Denoising Diffusion Null-Space Model (DDNM) data-fidelity term for noisy linear inverse problems.  
     This method is proposed in :cite:`wang2023zeroshot`, and reviewed in :cite:`daras2024survey`.
 
     The conditional mean is approximated by projecting the unconditional
@@ -846,7 +846,7 @@ class DDNMDataFidelity(NoisyDataFidelity):
 
         \mathbb{E}[x_0 \mid x_t, y]
         \approx
-        (I - A^\dagger A) \denoiser{x_t}{\sigma_t} + A^\dagger y.
+        (I - \Sigma_t A^\dagger A) \denoiser{x_t}{\sigma_t} + \Sigma_t A^\dagger y.
 
     Together with the conditional Tweedie formula, this yields the following
     approximation of the negative measurement score:
@@ -856,13 +856,15 @@ class DDNMDataFidelity(NoisyDataFidelity):
         -\nabla_{x_t} \log p_t(y \mid x_t)
         \approx
         \frac{1}{\sigma_t^2}
-        A^\dagger
+        \Sigma_t A^\dagger
         \left(\forw{\denoiser{x_t}{\sigma_t}} - y\right).
 
     .. note::
 
         This implementation adapts the DDNM to the measurement score formulation
         used by PosteriorDiffusion and fit in the SDE framework.
+        As suggested in the survey paper :cite:`daras2024survey`, here a soft updates
+        has been adopted. 
         It is not an implementation of the original discrete DDNM
         sampler or the noise-aware DDNM+ algorithm.
 
@@ -938,7 +940,6 @@ class DDNMDataFidelity(NoisyDataFidelity):
         #     * physics.A_dagger(residual)
         #     / (sigma_t**2 + sigma_y**2)
         # )
-        print(f"computing DDNM+ grad...")
 
         if get_model_outputs:
             return grad, x0_t.detach()
