@@ -1,33 +1,29 @@
 r"""
-Noisy data-fidelity terms for diffusion posterior sampling
+Experimental DDNM soft updates for noisy observations
 ==========================================================
 
-This example compares six approximations of the measurement-matching term
-used by diffusion posterior samplers.
+This script investigates a noise-aware extension of DDNM within
+the library's SDE-based posterior sampling framework.
 
-Three of them measure the mismatch directly at the noisy iterate :math:`x_t`, and
-therefore need no denoiser evaluation at all:
+Following the soft-update formulation discussed in
+*A Survey on Diffusion Models for Inverse Problems*
+(Section 3.1.9), we consider the approximation
 
-- Score-based Annealed Langevin Dynamics (Score-ALD) :footcite:t:`jalal2021robust`,
-- Score-SDE :footcite:t:`song2020score`,
-- Iterative Latent Variable Refinement (ILVR) :footcite:t:`choi2021ilvr`.
+ D_t^y \appro D_t + lambda_t A^dagger (y - A D_t),
 
-The other three first denoise :math:`x_t`, and differ in how much of the
-conditional uncertainty they keep:
+where D_t is the unconditional denoised estimate (by applying the denoiser) and D_t^y
+approximates E[x_0 | x_t, y].
 
-- Diffusion Posterior Sampling (DPS) :footcite:t:`chung2022diffusion`,
-- Pseudoinverse-Guided Diffusion Models (PiGDM) :footcite:t:`song2023pseudoinverse`,
-- Moment Matching :footcite:t:`rozet2024learning`.
+We choose
 
-We follow the presentation of *A Survey on Diffusion Models for Inverse Problems*
-:footcite:t:`daras2024survey`, which reviews these and other ways of incorporating
-measurements into diffusion models.
+    lambda_t = sigma_t^2 / (sigma_t^2 + sigma_y^2),
 
-Here, we focus on the noisy data-fidelity term itself. For a complete DPS
-reconstruction, including the diffusion schedule and reverse-time sampling
-loop, see :ref:`sphx_glr_auto_examples_sampling_demo_dps.py`. For a tutorial on
-assembling a posterior sampler from an SDE, a solver, and a data-fidelity term,
-see :ref:`sphx_glr_auto_examples_sampling_demo_diffusion_sde.py`.
+which can be motivated by Gaussian conditioning for binary-mask
+inpainting, assuming
+
+    p(x_0 | x_t) \appro N(D_t, sigma_t^2 I).
+
+Note that this choice presents a similar update to the score-ALD.
 """
 
 # %%
@@ -146,64 +142,51 @@ dinv.utils.plot(
 # %%
 # Score-ALD: guide with the noisy iterate itself
 # ----------------------------------------------
-#
-# The cheapest option is not to denoise at all. Score-ALD
-# :footcite:t:`jalal2021robust` evaluates the measurement mismatch directly at
-# :math:`x_t`, and compensates for the fact that :math:`x_t` is noisy by
-# inflating the measurement noise variance with an annealing parameter
-# :math:`\gamma_t`:
-#
-# .. math::
-#
-#     p_t(y\mid x_t)
-#     \approx \mathcal N\!\left(
-#         y; A x_t, (\sigma_y^2+\gamma_t^2)\mathrm I
-#     \right),
-#
-# which gives the guidance
-#
-# .. math::
-#
-#     \nabla_{x_t}\log p_t(x_t\mid y)
-#     \approx \nabla_{x_t}\log p_t(x_t)
-#       - \lambda \frac{A^\top (A x_t - y)}{\sigma_y^2+\gamma_t^2}.
-#
-# By default :math:`\gamma_t=\sigma_t`, so the guidance is weak early in the
-# diffusion, when :math:`x_t` is mostly noise, and strengthens as
-# :math:`\sigma_t\to 0`. Because that denominator already sets the scale,
-# ``weight=1`` is the natural choice here.
-
 ald = dinv.sampling.ALDDataFidelity(weight=1.0)
-
-# %%
-# Score-SDE and ILVR: noise the measurements instead
+# ILVR: noise the measurements instead
 # --------------------------------------------------
-#
-# Score-SDE :footcite:t:`song2020score` makes the same comparison, but first
-# lifts the measurements to the current noise level,
-#
-# .. math::
-#
-#     y_t = y + \sigma_t\epsilon,
-#     \qquad \epsilon\sim\mathcal N(0,\mathrm I),
-#
-# so that :math:`y_t` and :math:`A x_t` are corrupted by comparable amounts of
-# noise. ILVR :footcite:t:`choi2021ilvr` differs only in how the measurement
-# residual is lifted back to the image space: it uses the pseudo-inverse
-# :math:`A^\dagger` rather than the adjoint :math:`A^\top`,
-#
-# .. math::
-#
-#     \nabla_{x_t}\log p_t(x_t\mid y)
-#     \approx \nabla_{x_t}\log p_t(x_t)
-#       - \lambda \frac{A^\dagger (A x_t - y_t)}{\sigma_y^2+\gamma_t^2}.
-#
-
-# score_sde = dinv.sampling.ScoreSDEDataFidelity(weight=1.0)
 ilvr = dinv.sampling.ILVRDataFidelity(weight=1.0)
 
 # %%
-# DDNM
+# DDNM: from hard projection to soft updates
+# ------------------------------
+# For noiseless measurements, DDNM uses the hard projection
+#
+#     D_t^y ≈ D_t + A^dagger (y - A D_t).
+#
+# When y contains measurement noise, enforcing A D_t^y = y
+# can retain the noise in the reconstructed image.
+#
+# The survey suggests replacing the hard projection with
+# a soft correction:
+#
+#     D_t^y ≈ D_t + Sigma_t A^dagger (y - A D_t).
+#
+# Here we choose \Sigma_t = \lambda_t I, with
+#
+#     \lambda_t = \sigma_t^2 / (\sigma_t^2 + \sigma_y^2).
+#
+# For binary-mask inpainting, this choice follows from
+# Gaussian conditioning under the approximation
+#
+#     p(x_0 | x_t) ≈ N(D_t, sigma_t^2 I).
+#
+# Using the conditional Tweedie identity:
+#
+#     score_post ≈ (D_t^y - x_t) / sigma_t^2,
+#
+# or, equivalently, the negative measurement score is
+#
+#     g_DDNM = lambda_t A^dagger (A D_t - y) / sigma_t^2.
+#
+# DeepInverse implements the latter and combines it with
+# the unconditional score in PosteriorDiffusion.
+#
+# ------------------------------
+# This approximation modifies the conditional-mean estimate
+# but does not reproduce the noise correction of the original
+# discrete DDNM+ transitions.
+
 
 ddnm = dinv.sampling.DDNMDataFidelity(
     denoiser=denoiser,
@@ -390,64 +373,19 @@ for row, images in zip(axs, rows, strict=True):
     for ax in row[n:]: ax.set_visible(False)
 plt.show()
 
-# %%
-# All six recover the masked region, at very different costs: Score-ALD,
-# Score-SDE and ILVR need no denoiser evaluation for the guidance term, DPS
-# needs one backward pass through the denoiser, and PiGDM and Moment Matching
-# need a linear solve on top.
-
-# %%
-# DDNM: noiseless inpainting
-# -------------------------
-
-# clean_physics = dinv.physics.Inpainting(
-#     img_size=x_true.shape[1:],
-#     mask=mask,
-#     device=device,
-#     noise_model=dinv.physics.GaussianNoise(sigma=0.0),
-# )
-
-# y_clean = clean_physics(x_true)
-
-# ddnm = dinv.sampling.DDNMDataFidelity(
-#     denoiser=denoiser,
-#     weight=1.0,
-# )
-
-# ddnm_solver = dinv.sampling.EulerSolver(
-#     timesteps=timesteps,
-#     rng=torch.Generator(device=device),
-# )
-
-# ddnm_sampler = dinv.sampling.PosteriorDiffusion(
-#     data_fidelity=ddnm,
-#     denoiser=denoiser,
-#     sde=sde,
-#     solver=ddnm_solver,
-#     device=device,
-#     dtype=dtype,
-#     verbose=False,
-# )
-
-# with torch.no_grad():
-#     x_ddnm = ddnm_sampler(
-#         y_clean,
-#         clean_physics,
-#         seed=1,
-#         denoise_output=True,
-#     ).clip(0, 1)
-
-# dinv.utils.plot(
-#     {
-#         "Ground truth": x_true,
-#         "Measurement": y_clean,
-#         "DDNM": x_ddnm,
-#     }
-# )
 
 # %%
 # Check the cancellation of prior and measurement scores
-
+# The posterior score can be directly computed from the conditional Tweedie equation.
+# However, the library decomposes posterior score into prior score and measurement score, and 
+# within DDNM, the computation of measurement score makes use of the prior score.
+# The two ways should be equivalent, and we test it here in this cell.
+#
+#
+# IMPORTANT:
+# This verifies the score construction and implementation,
+# not whether D_t^y accurately approximates the true
+# conditional expectation E[x_0 | x_t, y].
 probe = dinv.sampling.PosteriorDiffusion(
     data_fidelity=ddnm,
     denoiser=denoiser,
@@ -550,7 +488,22 @@ for name, cfg in methods.items():
         "same physics =", cfg["physics"] is physics,
         "same y =", cfg["y"] is y,
     )
-
+# %%
+# comment:
+# - ALD and ILVR produce visibly cleaner reconstructions.
+# - Hard DDNM-style guidance retains substantial
+#   measurement noise.
+# - The current soft-update DDNM guidance also retains
+#   noticeable measurement noise.
+# - The numerical posterior-score consistency check
+#   confirms the expected Tweedie/Bayes decomposition.
+#
+# Two hypotheses for investigating the failure:
+# 1. the conditional mean approximation D_t^y is not sufficiently accurate.
+# 2. Continuous SDE sampling with the approximate posterior score may be different
+# than the DDNM+ in the original paper which employs discrete reverse transitions and adjust transition noise.
+# 
+# This experiment should not be interpreted as DDNM+ fails to be fit in the SDE sampling framework.
 # %%
 # :References:
 #
